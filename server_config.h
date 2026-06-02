@@ -365,6 +365,16 @@
                 Serial.println ("[WiFi] error reading /etc/dhcpcd.conf");
             }
 
+            // set WiFi mode
+            if (STA_SSID [0] != '\0') {
+                if (AP_SSID [0] != '\0')
+                    WiFi.mode (WIFI_AP_STA); // both, AP and STA modes
+                else
+                    WiFi.mode (WIFI_STA); // STA mode only
+            } else {
+                if (AP_SSID [0] != '\0')
+                    WiFi.mode (WIFI_AP); // AP mode only
+            }
 
             if (STA_SSID [0] != '\0') {
                 // set up STA
@@ -404,11 +414,11 @@
                 #endif
                 Serial.printf ("[WiFi][AP] setting up access point: %s\n", AP_SSID);
 
-                if (WiFi.softAP (AP_SSID, AP_PASSWORD)) { 
-                    // configure IP addresses
-
+                // configure IP addresses
+                if (AP_IP [0] != '\0')
                     WiFi.softAPConfig (IPAddress (AP_IP), IPAddress (AP_IP), IPAddress (AP_SUBNET_MASK));
-                    WiFi.begin ();
+
+                if (WiFi.softAP (AP_SSID, AP_PASSWORD)) { 
                     #ifdef __DMESG__
                         dmesgQueue << "[WiFi][AP] static IPv4 address: " << WiFi.softAPIP ();
                     #endif
@@ -421,17 +431,6 @@
                     Serial.println ("[WiFi][AP] failed to initialize access point");
                 }
             } 
-
-            // set WiFi mode
-            if (STA_SSID [0] != '\0') {
-                if (AP_SSID [0] != '\0')
-                    WiFi.mode (WIFI_AP_STA); // both, AP and STA modes
-                else
-                    WiFi.mode (WIFI_STA); // STA mode only
-            } else {
-                if (AP_SSID [0] != '\0')
-                    WiFi.mode (WIFI_AP); // AP mode only
-            }
 
             // rename hostname for all adapters
             esp_netif_t *netif = esp_netif_next_unsafe (NULL);
