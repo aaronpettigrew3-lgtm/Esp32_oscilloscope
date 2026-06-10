@@ -31,8 +31,8 @@
 
             // this information goes to /etc/wpa_supplicant.conf if file system is included
             // if DEFAULT_STA_SSID is left undefined STA will not be set up
-            #define DEFAULT_STA_SSID                          "YOUR_STA_SSID"
-            #define DEFAULT_STA_PASSWORD                      "YOUR_STA_PASSWORD"
+            #define DEFAULT_STA_SSID                          "CASS_AND_AARON"
+            #define DEFAULT_STA_PASSWORD                      "littlewindow956"
 
             // ----- DHCP or static IP address -----
 
