@@ -358,6 +358,7 @@
                 if (p4) {
                     // static IPv4 configuration
                     char *p;                    
+                    if ((p = strstr (p4, "\nstatic ip_address"))) sscanf (p + 18, "%*[ =]%16[0-9.]", AP_IP);
                     if ((p = strstr (p4, "\nnetmask"))) sscanf (p + 8, "%*[ =]%16[0-9.]", AP_SUBNET_MASK);
                     if ((p = strstr (p4, "\ngateway"))) sscanf (p + 8, "%*[ =]%16[0-9.]", AP_GATEWAY);
                 }
