@@ -40,6 +40,9 @@
     #define OSCILLOSCOPE_1SIGNAL_BUFFER_SIZE 333                      // max number of samples per screen, 333 samples (including 1 dummy sample) * 4 bytes per sample = 1332 bytes, which must be <= HTTP_WS_FRAME_MAX_SIZE - 8 (WebSocket header) = 1332
     #define OSCILLOSCOPE_2SIGNALS_BUFFER_SIZE 222                     // max number of samples per screen, 222 samples (including 1 dummy sample) * 6 bytes per sample = 1332 bytes, which must be <= HTTP_WS_FRAME_MAX_SIZE - 8 (WebSocket header) = 1332
 
+    // ADC Configuration: ESP32 ADC is configured with 11dB attenuation to support 0-3.3V range
+    // Default (0dB) only supports 0-1.1V. With 11dB attenuation enabled, you can measure voltages up to 3.3V.
+    // Note: Higher attenuation reduces ADC resolution (accuracy) as 12 bits are spread across a wider voltage range.
 
     // some ESP32 boards read analog values inverted, uncomment the following line to invert read values back again 
     // #define INVERT_ADC1_GET_RAW
@@ -1450,6 +1453,17 @@
             free (sharedMemory);
             return;
         }
+      }
+
+      // Configure ADC attenuation to read voltages > 1.1V
+      if (!strcmp (sharedMemory->readType, "analog")) {
+          // Set ADC width to 12-bit (default) and attenuation to 11dB (0-3.3V range)
+          adc1_config_width(ADC_WIDTH_BIT_12);
+          adc1_config_channel_atten(sharedMemory->adcchannel1, ADC_ATTEN_DB_11);
+          if ((unsigned char) sharedMemory->gpio2 <= 39) {
+              // If a second channel is used, configure it as well
+              adc1_config_channel_atten(sharedMemory->adcchannel2, ADC_ATTEN_DB_11);
+          }
       }
 
       // choose the corect oscReader
