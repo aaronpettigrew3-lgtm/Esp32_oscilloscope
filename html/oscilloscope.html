@@ -530,6 +530,63 @@
                     </div>
                 </div>
 
+                <!-- VOLTAGE DIVIDER CONFIGURATION -->
+                <div class='card'>
+                    <h2>Voltage Divider</h2>
+
+                    <div class='control-row'>
+                        <label>Enable Divider</label>
+                        <label class='switch'>
+                            <input type='checkbox' id='enableDivider' onchange="
+                                var enabled = document.getElementById('enableDivider').checked;
+                                document.getElementById('r1Input').disabled = !enabled;
+                                document.getElementById('r2Input').disabled = !enabled;
+                            ">
+                            <span class='slider'></span>
+                        </label>
+                    </div>
+
+                    <div class='control-row'>
+                        <label>R1 (Ω)</label>
+                        <input type='number' id='r1Input' min='0' step='1000' placeholder='e.g., 10000' disabled style='width: 120px; padding: 8px 10px; border-radius: 8px; font-size: 16px;'>
+                    </div>
+
+                    <div class='control-row'>
+                        <label>R2 (Ω)</label>
+                        <input type='number' id='r2Input' min='1' step='1000' placeholder='e.g., 10000' disabled style='width: 120px; padding: 8px 10px; border-radius: 8px; font-size: 16px;'>
+                    </div>
+
+                    <div style='font-size: 0.85rem; color: #666; margin-top: 10px; line-height: 1.4;'>
+                        <strong>Circuit:</strong> Input → R1 → GND<br>
+                        Measure across R2
+                    </div>
+                </div>
+
+                <!-- VOLTAGE READINGS -->
+                <div class='card'>
+                    <h2>Voltage Readings</h2>
+
+                    <div class='control-row'>
+                        <label>CH1 ADC:</label>
+                        <span id='ch1AdcVoltage' style='font-weight: bold;'>-- V</span>
+                    </div>
+
+                    <div id='ch1RealVoltageRow' class='control-row' style='display: none;'>
+                        <label>CH1 Real:</label>
+                        <span id='ch1RealVoltage' style='font-weight: bold; color: #ffbf80;'>-- V</span>
+                    </div>
+
+                    <div class='control-row' style='border-top: 1px solid #ddd; padding-top: 10px; margin-top: 10px;'>
+                        <label>CH2 ADC:</label>
+                        <span id='ch2AdcVoltage' style='font-weight: bold;'>-- V</span>
+                    </div>
+
+                    <div id='ch2RealVoltageRow' class='control-row' style='display: none;'>
+                        <label>CH2 Real:</label>
+                        <span id='ch2RealVoltage' style='font-weight: bold; color: #80d0ff;'>-- V</span>
+                    </div>
+                </div>
+
                 <!-- CONTROL BUTTONS -->
                 <div class='card'>
                     <h2>Control</h2>
@@ -634,6 +691,15 @@
             v = getCookie('markers'); if(v == 'false') document.getElementById('markers').checked = false;
             v = getCookie('remember'); if(v == 'true') document.getElementById('remember').checked = true;
 
+            // Load voltage divider settings from cookies
+            v = getCookie('enableDivider'); if(v == 'true') {
+                document.getElementById('enableDivider').checked = true;
+                document.getElementById('r1Input').disabled = false;
+                document.getElementById('r2Input').disabled = false;
+            }
+            v = getCookie('r1'); if(v != '') document.getElementById('r1Input').value = v;
+            v = getCookie('r2'); if(v != '') document.getElementById('r2Input').value = v;
+
             enableDisableControls(false);
 
             // save settings into cookies
@@ -653,6 +719,9 @@
                     setCookie('lines', document.getElementById('lines').checked, 3652);
                     setCookie('markers', document.getElementById('markers').checked, 3652);
                     setCookie('remember', document.getElementById('remember').checked, 3652);
+                    setCookie('enableDivider', document.getElementById('enableDivider').checked, 3652);
+                    setCookie('r1', document.getElementById('r1Input').value, 3652);
+                    setCookie('r2', document.getElementById('r2Input').value, 3652);
                 } else {
                     // delete cookies
                     setCookie('gpio1', '', -1);
@@ -668,10 +737,65 @@
                     setCookie('lines', '', -1);
                     setCookie('markers', '', -1);
                     setCookie('remember', '', -1);
+                    setCookie('enableDivider', '', -1);
+                    setCookie('r1', '', -1);
+                    setCookie('r2', '', -1);
                 }
             }
 
             var webSocket = null;
+
+            // Voltage divider calculations
+            const ADC_MAX = 4095;
+            const ESP32_VREF = 3.3; // ESP32 reference voltage
+            
+            function adcToVoltage(adcValue) {
+                // Convert ADC reading (0-4095) to voltage (0-3.3V)
+                return (adcValue / ADC_MAX) * ESP32_VREF;
+            }
+            
+            function calculateDividerVoltage(adcVoltage, r1, r2) {
+                // Apply voltage divider formula: V_actual = V_measured * ((R1 + R2) / R2)
+                // This assumes we're measuring across R2
+                if(r2 <= 0) return 0;
+                return adcVoltage * ((r1 + r2) / r2);
+            }
+            
+            function updateVoltageReadings(ch1Value, ch2Value) {
+                // Update voltage display with ADC and actual voltages
+                const enableDivider = document.getElementById('enableDivider').checked;
+                const r1 = parseFloat(document.getElementById('r1Input').value) || 0;
+                const r2 = parseFloat(document.getElementById('r2Input').value) || 1;
+                
+                // CH1 readings
+                const ch1Adc = adcToVoltage(ch1Value);
+                document.getElementById('ch1AdcVoltage').textContent = ch1Adc.toFixed(3) + ' V';
+                
+                if(enableDivider && r1 > 0 && r2 > 0) {
+                    const ch1Real = calculateDividerVoltage(ch1Adc, r1, r2);
+                    document.getElementById('ch1RealVoltage').textContent = ch1Real.toFixed(3) + ' V';
+                    document.getElementById('ch1RealVoltageRow').style.display = 'flex';
+                } else {
+                    document.getElementById('ch1RealVoltageRow').style.display = 'none';
+                }
+                
+                // CH2 readings (if enabled)
+                if(ch2Value !== undefined && ch2Value >= 0) {
+                    const ch2Adc = adcToVoltage(ch2Value);
+                    document.getElementById('ch2AdcVoltage').textContent = ch2Adc.toFixed(3) + ' V';
+                    
+                    if(enableDivider && r1 > 0 && r2 > 0) {
+                        const ch2Real = calculateDividerVoltage(ch2Adc, r1, r2);
+                        document.getElementById('ch2RealVoltage').textContent = ch2Real.toFixed(3) + ' V';
+                        document.getElementById('ch2RealVoltageRow').style.display = 'flex';
+                    } else {
+                        document.getElementById('ch2RealVoltageRow').style.display = 'none';
+                    }
+                } else {
+                    document.getElementById('ch2AdcVoltage').textContent = '-- V';
+                    document.getElementById('ch2RealVoltageRow').style.display = 'none';
+                }
+            }
 
             function stopOscilloscope() {
                 if(webSocket != null) {
@@ -1026,6 +1150,8 @@
             var lastJ2; // signal 2
 
             var wordsPerSample = 1; // will be correctly initialized when dummy sample arrives: 2 for 1 signal, 3 for 2 signals
+            var lastCh1Value = 0; // for voltage readings
+            var lastCh2Value = -1; // for voltage readings
 
             function drawSignal(myInt16Array, startInd, endInd) {
                 if(startInd > endInd) return;
@@ -1072,6 +1198,14 @@
                     i = xOffset + xScale * screenTimeOffset;   // time
                     j1 = yOffset + yScale * myInt16Array [ind]; // signal 1
                     j2 = wordsPerSample >= 3 ? yOffset + yScale * myInt16Array [ind + 1] : -1; // signal 2, -1 if missing
+
+                    // Store last ADC values for voltage reading display
+                    lastCh1Value = myInt16Array [ind];
+                    if(wordsPerSample >= 3) {
+                        lastCh2Value = myInt16Array [ind + 1];
+                    } else {
+                        lastCh2Value = -1;
+                    }
 
                     // lines
                     if(lines) {
@@ -1134,6 +1268,9 @@
                     lastJ1 = j1;
                     lastJ2 = j2;
                 }
+
+                // Update voltage readings display after drawing
+                updateVoltageReadings(lastCh1Value, lastCh2Value);
             }
 
             // eneable and disable controls
