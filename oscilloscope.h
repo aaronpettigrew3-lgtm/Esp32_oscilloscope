@@ -17,6 +17,7 @@
 #include "hal/gpio_hal.h"
 // #include <soc/gpio_sig_map.h> // to digitalRead PWM and other GPIOs ...
 #include <driver/adc.h>       // to use adc1_get_raw instead of analogRead
+#include <esp_adc_cal.h>      // legacy factory (eFuse) ADC calibration; matches the adc1_get_raw path
 #include <driver/i2s.h>
 #include <ostream.hpp>
 #include <Cstring.hpp>
@@ -122,6 +123,11 @@
       gpio_num_t gpio2;                       // 2nd gpio if requested
       adc1_channel_t adcchannel1;             // channel mapped from gpio ESP32 is taking samples from (adc1_get_raw instead of analogRead)
       adc1_channel_t adcchannel2;             // channel mapped from gpio ESP32 is taking samples from (adc1_get_raw instead of analogRead)
+      // ADC calibration (legacy esp_adc_cal) — derived once at init, ~12 bytes, no LUT.
+      // Classic-ESP32 calibration is linear, so mV = raw * adcCalSlope + adcCalOffset.
+      float adcCalSlope;                      // mV per ADC count
+      float adcCalOffset;                     // mV at count 0
+      int adcCalType;                         // esp_adc_cal_value_t: 0=TwoPoint, 1=eFuse Vref, 2=Default Vref
       int samplingTime;                       // time between samples in ms or us
       char samplingTimeUnit [3];              // ms or us
       unsigned long screenWidthTime;          // oscilloscope screen width in ms or us
@@ -1464,6 +1470,24 @@
               // If a second channel is used, configure it as well
               adc1_config_channel_atten(sharedMemory->adcchannel2, ADC_ATTEN_DB_11);
           }
+
+          // Factory (eFuse) calibration: characterize once, then reduce to a linear
+          // mV = raw * slope + offset mapping. This keeps the sample loop reading raw
+          // counts (zero hot-path cost) and costs ~12 bytes of RAM (no lookup table).
+          // NOTE: 11dB attenuation is only linear ~0.15V-2.45V; readings near 0V/3.3V
+          // saturate and cannot be trusted regardless of calibration.
+          esp_adc_cal_characteristics_t adcChars;
+          esp_adc_cal_value_t calType = esp_adc_cal_characterize (ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adcChars);
+          uint32_t mvAt0    = esp_adc_cal_raw_to_voltage (0,    &adcChars);
+          uint32_t mvAt4095 = esp_adc_cal_raw_to_voltage (4095, &adcChars);
+          sharedMemory->adcCalOffset = (float) mvAt0;
+          sharedMemory->adcCalSlope  = (float) (mvAt4095 - mvAt0) / 4095.0f;
+          sharedMemory->adcCalType   = (int) calType;
+          dmesgQueue << "[oscilloscope] ADC calibration: "
+                     << (calType == ESP_ADC_CAL_VAL_EFUSE_TP    ? "TwoPoint (eFuse BLOCK3)"
+                       : calType == ESP_ADC_CAL_VAL_EFUSE_VREF  ? "eFuse Vref (factory)"
+                       :                                          "Default Vref 1100mV (no eFuse data - low accuracy)")
+                     << ", mV = raw * " << sharedMemory->adcCalSlope << " + " << sharedMemory->adcCalOffset;
       }
 
       // choose the corect oscReader

@@ -1,240 +1,129 @@
-# ESP32 Oscilloscope ADC Calibration Improvements Plan
+# ESP32 Oscilloscope — ADC Calibration Plan (revised)
 
-## Executive Summary
+## Executive summary
 
-**Current State:** Basic ADC reading without any hardware calibration or averaging
-**Potential Gain:** 5-10x accuracy improvement with factory calibration + averaging
+**Current state:** the firmware reads raw ADC counts with `adc1_get_raw()` (12-bit,
+11 dB attenuation) and ships **raw 0–4095 counts** to the browser. There is *no*
+voltage conversion in the firmware at all — the JS canvas just scales counts to pixels
+([oscilloscope.h:1461](oscilloscope.h#L1461),
+[amber_oscilloscope_html.h:880](amber/amber_oscilloscope_html.h#L880)).
 
-The ESP32 comes with factory-calibrated ADC data stored in eFuse. The current implementation ignores this, relying only on a linear conversion with a fixed 3.3V reference. By leveraging factory calibration and software techniques, we can achieve significantly better accuracy.
+**Goal:** add factory (eFuse) calibration so counts can be shown as real millivolts,
+without slowing the sample loop and without meaningful RAM cost.
 
----
+**Decision (locked in):** stay on the **legacy `esp_adc_cal` / `driver/adc.h`** API to
+match the existing `adc1_get_raw` code path. Smallest diff; emits a deprecation warning
+on Arduino-ESP32 core 3.x but compiles and works.
 
-## Critical Findings
-
-### 1. **Missing Factory Calibration (Two-Point eFuse Data)**
-- **Current:** Linear conversion only: `V = (ADC_reading / 4095) * 3.3V`
-- **Impact:** ±10% typical error depending on board variant
-- **Solution:** Use `esp_adc_cal.h` library for automatic factory calibration correction
-  - ESP32 includes two calibration points stored in eFuse
-  - Provides offset + gain corrections
-  - Dramatically improves accuracy (typically ±3-5% error → ±1% error)
-
-### 2. **No Hardware Averaging**
-- **Current:** Every sample is raw and unfiltered
-- **Impact:** High noise floor, unstable readings especially at low voltages
-- **Solution:** Enable ADC hardware averaging (12-bit resolution)
-  - ESP32 supports hardware averaging over 8 or 16 measurements
-  - Reduces noise without sacrificing speed
-  - More efficient than software averaging
-
-### 3. **No Temperature Compensation**
-- **Current:** Assumes constant reference voltage across temperature range
-- **Impact:** ±0.5-1% error per 10°C temperature swing
-- **Solution:** `esp_adc_cal` library includes temperature compensation
-  - Can use internal temperature sensor to adjust readings
-  - Or allow manual reference voltage calibration
-
-### 4. **Fixed Reference Voltage Assumption**
-- **Current:** Hard-coded 3.3V reference
-- **Impact:** Varies by board: ±2-3% deviation common
-- **Solution:** 
-  - Use factory calibration (auto-corrects for actual VREF)
-  - Or allow user calibration via known voltage source
-
-### 5. **No ADC Linearization**
-- **Current:** Linear mapping assumed perfect
-- **Impact:** ADC response is non-linear, especially at high attenuation levels
-- **Benefit:** Curve fitting could improve accuracy by 2-3%
+**Realistic accuracy:** raw ±10% → **±1–3%** across the calibrated range with eFuse
+calibration; **±0.5%** only with an additional *user* two-point calibration against a
+precision reference. The original "±10% → ±0.5% from two changes" was optimistic.
 
 ---
 
-## Proposed Improvements (Priority Order)
+## Corrections to the previous plan (important)
 
-### PRIORITY 1: Implement Factory Calibration (Highest Impact)
-**Effort:** LOW | **Accuracy Gain:** 3-5x | **Lines Added:** ~50
+These were wrong or outdated in the first draft and are not part of the approach:
 
-Add `esp_adc_cal.h` support to automatically correct for factory-calibrated offset and gain:
+1. **`esp_adc_cal.h` is deprecated** on ESP-IDF v5 / core 3.x. We keep it deliberately
+   (consistent with the legacy `adc1_get_raw` path), not by accident.
+2. **There is no hardware averaging on the classic ESP32 oneshot ADC.** The
+   `adc_digi_config_t{ .samples = 16 }` snippet was fabricated — that struct/field does
+   not exist. Averaging is **software only**.
+3. **No runtime temperature compensation exists in the library.** `esp_adc_cal`
+   characterizes once; it never adjusts for temperature. Dropped.
+4. **No curve-fit linearization on classic ESP32.** Only line fitting is available
+   (curve fitting is S2/S3/C3 only). Any polynomial would be hand-rolled. Dropped.
+5. **No 8 KB LUT needed.** Because classic-ESP32 calibration is linear, a slope+intercept
+   pair (~8 bytes) reproduces it exactly. This is the memory-friendly core of the plan.
+
+---
+
+## Hardware limits that cap accuracy regardless of software
+
+- **11 dB attenuation is only linear ~0.15 V–2.45 V.** Below ~0.1 V and above ~2.5 V the
+  ADC saturates/clips. Near 0 V and near 3.3 V cannot be measured accurately by any
+  software means. (Newer cores rename `ADC_ATTEN_DB_11` → `ADC_ATTEN_DB_12`.)
+- **Source impedance must be low (< ~10 kΩ)** and a **100 nF cap** on the ADC pin is
+  Espressif's explicit noise recommendation. Do this before chasing software percent.
+- **ADC2 is unusable here** — this is a WiFi-AP scope and ADC2 is blocked while WiFi is
+  active ([oscilloscope.h:1167](oscilloscope.h#L1167)). Use ADC1 only (GPIO 32–39).
+- **Many pre-2018 chips have no eFuse calibration.** They fall back to the default
+  1100 mV Vref and gain almost nothing. The firmware must report which scheme it got so
+  the user isn't misled.
+
+---
+
+## Approach (memory-aware, sample-loop-safe)
+
+### 1. Characterize once at init
+After the existing attenuation config
+([oscilloscope.h:1461](oscilloscope.h#L1461)):
 
 ```cpp
 #include <esp_adc_cal.h>
 
-// At initialization time:
 esp_adc_cal_characteristics_t adc_chars;
 esp_adc_cal_value_t cal_type = esp_adc_cal_characterize(
-    ADC_UNIT_1, 
-    ADC_ATTEN_DB_11,  // Must match your attenuation
-    ADC_WIDTH_BIT_12, 
-    1100,             // Reference voltage in mV
-    &adc_chars
-);
-
-// When reading:
-uint32_t adc_reading = adc1_get_raw(channel);
-uint32_t voltage_mV = esp_adc_cal_raw_to_voltage(adc_reading, &adc_chars);
+    ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+// cal_type ∈ { TP, EFUSE_VREF, DEFAULT_VREF } — report this to the user.
 ```
 
-**Benefits:**
-- Removes systematic offset and gain errors
-- Works automatically for any ESP32 variant
-- Built into Arduino core (no additional library)
-
----
-
-### PRIORITY 2: Implement Hardware Averaging (Quick Win)
-**Effort:** LOW | **Accuracy Gain:** 2-3x | **Lines Added:** ~20
-
-Enable ADC hardware oversampling using driver configuration:
+### 2. Derive a linear count→mV mapping (no LUT, ~8 bytes)
+Classic-ESP32 calibration is linear, so two evaluations fully describe it:
 
 ```cpp
-adc_digi_config_t config = {
-    .conv_num_each_intr = 1,
-    .adc_pattern = ADC_PATTERN_FAST,
-    .samples = 16,  // Average 16 consecutive reads
-};
+uint32_t mv_lo = esp_adc_cal_raw_to_voltage(0,    &adc_chars);  // intercept
+uint32_t mv_hi = esp_adc_cal_raw_to_voltage(4095, &adc_chars);  // for slope
+float mv_per_count = (float)(mv_hi - mv_lo) / 4095.0f;
+// store mv_lo (offset) and mv_per_count (slope) — that's the whole calibration
 ```
 
-Or simpler approach - software averaging in reader:
-```cpp
-#define ADC_AVERAGING_SAMPLES 8
-uint32_t samples[ADC_AVERAGING_SAMPLES];
-for (int i = 0; i < ADC_AVERAGING_SAMPLES; i++) {
-    samples[i] = adc1_get_raw(channel);
-}
-uint32_t avg = average(samples, ADC_AVERAGING_SAMPLES);
-```
+This avoids any per-sample library call **and** any lookup table. The hot reader loop
+([oscilloscope.h:248-274](oscilloscope.h#L248)) keeps calling `adc1_get_raw` unchanged.
 
-**Trade-offs:**
-- Reduces sampling rate by factor of 8-16 (acceptable for oscilloscope use)
-- Significantly improves SNR and stability
+### 3. Convert at the edge, not in the loop
+Ship the two coefficients (`offset`, `slope`) and `cal_type` to the browser **once**, and
+compute `mV = raw * slope + offset` in JS at render time for axis labels / cursor
+readouts. Zero firmware hot-path cost, zero extra RAM. (Alternative: apply the MAC in
+firmware only when serializing a frame — also cheap — if we'd rather not touch the JS.)
 
----
-
-### PRIORITY 3: Add Temperature Compensation (Optional)
-**Effort:** MEDIUM | **Accuracy Gain:** 0.5-1% | **Lines Added:** ~30
-
-Use `esp_adc_cal` which includes temperature effects:
-
-```cpp
-// If temperature changes significantly:
-esp_adc_cal_characterize(
-    ADC_UNIT_1,
-    ADC_ATTEN_DB_11,
-    ADC_WIDTH_BIT_12,
-    1100 + temp_correction_mV,  // Adjust for temperature
-    &adc_chars
-);
-```
-
-Or monitor temperature via internal sensor and adjust gain compensation.
+### 4. Averaging only in a future DC mode
+Multisampling divides effective sample rate by N and low-pass-filters the signal — wrong
+for live waveforms. If a dedicated slow "voltmeter" mode is added later, use 16–64×
+software averaging there only. Not part of the fast timebases.
 
 ---
 
-### PRIORITY 4: Manual Calibration Interface (User Control)
-**Effort:** MEDIUM | **Accuracy Gain:** 1-2% | **Lines Added:** ~60
+## Implementation steps
 
-Add UI feature to calibrate against known voltage source:
+1. `#include <esp_adc_cal.h>` and add the characterization + coefficient derivation right
+   after the `adc1_config_channel_atten` block ([oscilloscope.h:1462](oscilloscope.h#L1462)).
+2. Store `offset`, `slope`, `cal_type` in the scope's shared/config struct.
+3. Emit cal status to the dmesg/serial log (and ideally to the JS client) so the user sees
+   `TwoPoint` / `eFuse Vref` / `Default Vref`.
+4. Wire the two coefficients into the websocket/config handshake and add a voltage axis
+   (or cursor mV readout) in the HTML/JS.
+5. (Optional, later) user two-point calibration vs. a known reference, stored in NVS, to
+   reach ±0.5%.
 
-```cpp
-void calibrateADC(float knownVoltage, int16_t adcReading) {
-    // User provides a known voltage and corresponding ADC reading
-    // Store calibration offset and gain in EEPROM
-    // Future readings apply: V_actual = esp_adc_cal(adc_reading) * gain + offset
-}
-```
-
-**UI Enhancement:**
-- Add "Calibrate" button in oscilloscope.html
-- User inputs known reference voltage (e.g., 1.5V from power supply)
-- System measures ADC and stores correction factors
+**RAM cost:** ~12 bytes (two floats + an enum). **Flash:** the `esp_adc_cal` code, already
+in the core. **Hot-loop cost:** none (raw read unchanged).
 
 ---
 
-## Impact Analysis
+## Testing
 
-### Accuracy Improvements
-| Technique | Before | After | Gain |
-|-----------|--------|-------|------|
-| Current | ±10% | - | - |
-| + Factory Cal | - | ±2-3% | 3-5x |
-| + Averaging | - | ±1-1.5% | 2-3x (cumulative) |
-| + Manual Cal | - | ±0.5% | 2-3x (cumulative) |
-
-### Performance Impact (Sampling Rate)
-- Factory calibration: **No impact** (lookup cost ~1-2µs)
-- 8x averaging: **Reduces effective rate by 8x** (acceptable: 100ksps → 12.5ksps)
-- Temperature comp: **Negligible** (updated once at startup)
+1. **Accuracy:** feed 0.5 V, 1.0 V, 1.65 V, 2.0 V from a bench supply (stay inside the
+   0.15–2.45 V linear window) and compare to a DMM.
+2. **Cal scheme:** confirm the logged `cal_type` — if `Default Vref`, expect little gain.
+3. **Stability:** hold a steady voltage 60 s, check spread (and the effect of a 100 nF cap).
+4. **No regression:** verify sample rate / waveform timing is unchanged after the edits.
 
 ---
 
-## Implementation Roadmap
-
-### Phase 1: Foundation (MUST DO)
-1. Add `esp_adc_cal.h` factory calibration support
-2. Implement 8x software averaging
-3. Update HTML voltage display to show calibration status
-4. Test accuracy improvements
-
-### Phase 2: Enhancement (SHOULD DO)
-5. Add temperature sensor integration
-6. Expose averaging factor as configurable parameter
-7. Log calibration type and VREF used
-
-### Phase 3: Advanced (NICE TO HAVE)
-8. Add manual calibration UI
-9. Store calibration data in EEPROM per channel
-10. Implement gain/offset adjustments
-
----
-
-## Technical Notes
-
-### Channel-Specific Calibration
-- Each ADC channel may have slightly different characteristics
-- `esp_adc_cal` handles this automatically
-- If using multiple channels, calibrate each separately
-
-### Attenuation Dependency
-- **Critical:** Calibration is specific to each attenuation level
-- Since we're using ADC_ATTEN_DB_11 (11dB), ensure calibration uses same
-- Different attenuation = different linearity and reference voltage
-
-### I2S Interface Compatibility
-- If using `USE_I2S_INTERFACE`, I2S has its own ADC configuration
-- May need separate calibration path for I2S reads
-- Should be lower priority than direct ADC1 calibration
-
-### Reference Voltage (VREF)
-- ESP32 typical VREF: 1.1V (internal reference)
-- With 11dB attenuation, effective reference scales to ~3.3V
-- `esp_adc_cal` automatically handles this mapping
-
----
-
-## Code Estimate
-
-- **Factory Calibration:** ~40 lines (core functionality)
-- **Averaging:** ~25 lines (if software approach)
-- **UI Updates:** ~10 lines (status display)
-- **Total Phase 1:** ~75 lines added
-
----
-
-## Testing Recommendations
-
-1. **Accuracy Test:** Measure known voltages (0V, 1.65V, 3.3V) with precision multimeter
-2. **Stability Test:** Monitor same voltage reading for 1 minute, check variance
-3. **Temperature Test:** Run at different room temperatures and compare offsets
-4. **Noise Test:** Graph ADC readings with/without averaging to visualize SNR improvement
-
----
-
-## Conclusion
-
-**High-Priority Actions:**
-1. ✅ Add factory calibration (3-5x accuracy gain, 40 lines)
-2. ✅ Add 8x averaging (2-3x additional gain, 25 lines)
-
-These two changes alone could improve accuracy from ±10% to **±0.5-1%**, which is significant for an oscilloscope application.
-
-The remaining enhancements (temperature compensation, manual calibration) provide diminishing returns but are valuable for professional accuracy needs.
-
+## Sources
+- ADC calibration driver (current): https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/adc/adc_calibration.html
+- Legacy ADC (eFuse Vref / two-point, noise/multisampling): https://docs.espressif.com/projects/esp-idf/en/v4.4/esp32/api-reference/peripherals/adc.html
+- v5 migration (legacy deprecation): https://docs.espressif.com/projects/esp-idf/en/release-v5.0/esp32c2/migration-guides/release-5.x/peripherals.html
+- Two-point calibration scheme: https://docs.espressif.com/projects/esp-iot-solution/en/latest/others/adc_tp_calibration.html
